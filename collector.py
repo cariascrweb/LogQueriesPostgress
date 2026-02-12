@@ -1,8 +1,8 @@
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
-import psycopg2
+from psycopg2 import OperationalError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -55,40 +55,61 @@ def main():
     validate_config()
 
     seen = load_seen(LOG_FILE)
-    print(f"[INFO] target user={TARGET_USR} interval={POLL_INTERVAL}s loaded_seen={len(seen)} log={LOG_FILE}")
+    print(f"[INFO] target user={TARGET_USR} interval={POLL_INTERVAL}s loaded_seen={len(seen)} log={LOG_FILE}", flush=True)
 
-    conn = psycopg2.connect(**DB_CONFIG)
-    conn.autocommit = True
-    cur = conn.cursor()
+    backoff = 2  # seconds
+    while True:
+        conn = None
+        cur = None
+        try:
+            conn = psycopg2.connect(**DB_CONFIG)
+            conn.autocommit = True
+            cur = conn.cursor()
+            print("[INFO] connected to postgres", flush=True)
+            backoff = 2  # reset after successful connect
 
-    try:
-        while True:
-            cur.execute(QUERY_SQL, (TARGET_USR,))
-            rows = cur.fetchall()
+            while True:
+                try:
+                    cur.execute(QUERY_SQL, (TARGET_USR,))
+                    rows = cur.fetchall()
+                except OperationalError as e:
+                    print(f"[WARN] query failed; reconnecting: {e}", flush=True)
+                    break  # reconnect
 
-            new = []
-            for (q,) in rows:
-                if not q:
-                    continue
-                qn = normalize(q)
-                if qn not in seen:
-                    seen.add(qn)
-                    new.append(qn)
+                new = []
+                for (q,) in rows:
+                    if not q:
+                        continue
+                    qn = normalize(q)
+                    if qn not in seen:
+                        seen.add(qn)
+                        new.append(qn)
 
-            if new:
-                ts = datetime.utcnow().isoformat() + "Z"
-                with open(LOG_FILE, "a", encoding="utf-8") as f:
-                    for q in new:
-                        f.write(f"[{ts}] {q}\n")
-                print(f"[+] captured {len(new)} new queries (total_seen={len(seen)})")
+                if new:
+                    ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                    with open(LOG_FILE, "a", encoding="utf-8") as f:
+                        for q in new:
+                            f.write(f"[{ts}] {q}\n")
+                    print(f"[+] captured {len(new)} new queries (total_seen={len(seen)})", flush=True)
 
-            time.sleep(POLL_INTERVAL)
+                time.sleep(POLL_INTERVAL)
 
-    except KeyboardInterrupt:
-        print("\n[INFO] stopped")
-    finally:
-        cur.close()
-        conn.close()
+        except OperationalError as e:
+            print(f"[WARN] connect failed: {e}", flush=True)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+        finally:
+            try:
+                if cur:
+                    cur.close()
+            except Exception:
+                pass
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     main()
